@@ -1,0 +1,249 @@
+name: $(BuildDefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    exclude:
+    - 'README.md'
+    - 'tests/*'
+    include:
+      - 'acr/*'
+pr:
+  branches:
+    include:
+      - master
+      - feature/*
+  paths:
+    exclude:
+    - 'README.md'
+    - 'tests/*'
+    include:
+      - 'acr/*'
+variables:
+  acrUserNameKVSecret: 'acrUserName'
+  acrPasswordKvSecret: 'acrPassword'
+stages:
+- stage: test_and_build
+  displayName: 'Test and Build'
+  variables:
+  - group: variables - acr (dev)
+  jobs:
+  - job: security_scan
+    displayName: Security Scan
+    pool:
+      vmImage: windows-latest
+    steps:
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-antimalware.AntiMalware@3
+      displayName: 'AntiMalware Scan'
+      inputs:
+        FileDirPath: '$(Build.SourcesDirectory)'
+        EnableServices: true
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-credscan.CredScan@2
+      displayName: 'Run Credential Scanner'
+      inputs:
+        outputFormat: csv
+        scanFolder: '$(Build.SourcesDirectory)'
+        verboseOutput: true
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-publishsecurityanalysislogs.PublishSecurityAnalysisLogs@2
+      displayName: 'Publish Security Analysis Logs'
+      condition: succeededOrFailed()
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-report.SdtReport@1
+      displayName: 'Create Security Analysis Report'
+      inputs:
+        AllTools: true
+      condition: succeededOrFailed()
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-postanalysis.PostAnalysis@1
+      displayName: 'Post Analysis'
+      inputs:
+        AllTools: true
+      condition: succeededOrFailed()
+  - job: Pester_Tests
+    displayName: Pester Tests
+    dependsOn: security_scan
+    pool:
+      vmImage: windows-latest
+    steps:
+    - powershell: |
+        $FeedName = 'PSGallery'
+        Install-PackageProvider Nuget -Scope CurrentUser -Force
+        Install-module Pester -force -Scope CurrentUser -Repository $FeedName -SkipPublisherCheck
+        Install-module PSScriptAnalyzer -force -Scope CurrentUser -Repository $FeedName -SkipPublisherCheck
+        Install-module PSPesterTest -force -Scope CurrentUser -Repository $FeedName -SkipPublisherCheck
+      displayName: 'Install PowerShell modules'
+    - powershell: |
+        Import-Module PSPesterTest 
+        Test-PSScriptAnalyzerRule -path $(System.DefaultWorkingDirectory) -recurse -OutputFile $(System.DefaultWorkingDirectory)\TEST-PSScripts.xml
+      displayName: 'Test - PSScriptAnalyzer'
+      errorActionPreference: continue
+    - task: RunARMTTKTests@1
+      inputs:
+        templatelocation: '$(System.DefaultWorkingDirectory)\acr\templates'
+        resultLocation: '$(System.DefaultWorkingDirectory)'
+      displayName: 'Test - ARM Toolkit (arm-ttk)'
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results $(System.DefaultWorkingDirectory)\TEST-*.xml'
+      inputs:
+        testResultsFormat: NUnit
+        testResultsFiles: '**/*.xml' 
+        failTaskOnFailedTests: true
+  - job: ARM_Deployment_Validation
+    displayName: ARM Deployment Validation
+    dependsOn: Pester_Tests
+    pool:
+      vmImage: windows-latest
+    steps:
+    - task: AzurePowerShell@5
+      displayName: 'Get workload subscription Id'
+      inputs:
+        azureSubscription: 'sub-workload-dev'
+        ScriptType: InlineScript
+        Inline: |
+          $ctx = get-azcontext
+          $subId = $ctx.subscription.id
+          $aadApp = Get-AzADApplication -ApplicationId $ctx.account.id
+          $spId = (Get-AzADServicePrincipal -ApplicationId $aadApp.applicationId).Id
+          Write-Output ("##vso[task.setvariable variable=workloadSubId]$subId")
+          Write-Output ("##vso[task.setvariable variable=spId]$spId")
+        azurePowerShellVersion: LatestVersion
+    - task: AzureResourceManagerTemplateDeployment@3
+      displayName: 'Template Validation - Azure Container Registry'
+      inputs:
+        deploymentScope: Resource Group
+        resourceGroupName: $(resourceGroup)
+        azureResourceManagerConnection: 'sub-workload-dev'
+        subscriptionId: '$(workloadSubId)'
+        location: '$(acrLocation)'
+        csmFile: acr/templates/azuredeploy.json
+        overrideParameters: '-acrName $(acrName) -acrReplicaLocation $(acrReplicaLocation) -acrLocation $(acrLocation) -AzpAzpServicePrincipalId $(spId)'
+        deploymentMode: Validation
+  - job: Publish_Pattern
+    displayName: Publish Pattern
+    pool:
+      vmImage: windows-latest
+    dependsOn: ARM_Deployment_Validation
+    steps:
+    - task: CopyFiles@2
+      displayName: 'Copy Files to: $(Build.ArtifactStagingDirectory)'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)/acr'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/acr'
+        CleanTargetFolder: true
+        OverWrite: true
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact: acr'
+      inputs:
+        artifactName: 'acr'
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/acr'
+- stage: lab_deploy
+  displayName: 'Deploy Dev Stage'
+  jobs:
+    - deployment: dev_deploy
+      variables:
+      - group: variables - acr (dev)
+      displayName: 'Deploy to Dev'
+      pool:
+        vmImage: windows-latest
+        timeoutInMinutes: 120
+      environment: 'dev'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzurePowerShell@5
+              displayName: 'Get workload subscription Id'
+              inputs:
+                azureSubscription: 'sub-workload-dev'
+                ScriptType: InlineScript
+                Inline: |
+                  $ctx = get-azcontext
+                  $subId = $ctx.subscription.id
+                  $aadApp = Get-AzADApplication -ApplicationId $ctx.account.id
+                  $spId = (Get-AzADServicePrincipal -ApplicationId $aadApp.applicationId).Id
+                  Write-Output ("##vso[task.setvariable variable=workloadSubId]$subId")
+                  Write-Output ("##vso[task.setvariable variable=spId]$spId")
+                azurePowerShellVersion: LatestVersion
+            - task: AzureResourceManagerTemplateDeployment@3
+              displayName: 'Template Deployment - Dev'
+              inputs:
+                deploymentScope: Resource Group
+                resourceGroupName: $(resourceGroup)
+                azureResourceManagerConnection: 'sub-workload-dev'
+                subscriptionId: '$(workloadSubId)'
+                location: '$(acrLocation)'
+                csmFile: $(Agent.BuildDirectory)/acr/templates/azuredeploy.json
+                overrideParameters: '-acrName $(acrName) -acrReplicaLocation $(acrReplicaLocation) -acrLocation $(acrLocation) -AzpAzpServicePrincipalId $(spId)'
+                deploymentOutputs: 'ArmOutputs'
+                deploymentMode: Incremental
+            - task: PowerShell@2
+              inputs:
+                targetType: filePath
+                filePath: $(Agent.BuildDirectory)/acr/scripts/ParseARMOutputs.ps1
+                arguments: -ArmOutputString '$(ArmOutputs)'
+                pwsh: true
+              displayName: "Parsing outputs from ARM deployment to pipeline variables"
+            - task: AzurePowerShell@5
+              displayName: 'Add ACR Credential to Key Vault'
+              inputs:
+                azureSubscription: 'sub-workload-dev'
+                ScriptType: filePath
+                ScriptPath: $(Agent.BuildDirectory)/acr/scripts/AddACRCredToKV.ps1
+                ScriptArguments: -acrResourceGroup '$(resourceGroup)' -acrName '$(acrName)' -kvName '$(keyvaultName)' -acrUserNameSecretName '$(acrUserNameKVSecret)' -acrPwSecretName '$(acrPasswordKvSecret)'
+                azurePowerShellVersion: LatestVersion
+- stage: prod_deploy
+  displayName: 'Deploy Prod Stage'
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master')) 
+  jobs:
+    - deployment: prod_deploy
+      variables:
+      - group: variables - acr (prod)
+      displayName: 'Deploy to Prod'
+      pool:
+        vmImage: windows-latest
+        timeoutInMinutes: 120
+      timeoutInMinutes: 120
+      environment: 'prod'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzurePowerShell@5
+              displayName: 'Get workload subscription Id'
+              inputs:
+                azureSubscription: 'sub-workload-prod'
+                ScriptType: InlineScript
+                Inline: |
+                  $ctx = get-azcontext
+                  $subId = $ctx.subscription.id
+                  $aadApp = Get-AzADApplication -ApplicationId $ctx.account.id
+                  $spId = (Get-AzADServicePrincipal -ApplicationId $aadApp.applicationId).Id
+                  Write-Output ("##vso[task.setvariable variable=workloadSubId]$subId")
+                  Write-Output ("##vso[task.setvariable variable=spId]$spId")
+                azurePowerShellVersion: LatestVersion
+            - task: AzureResourceManagerTemplateDeployment@3
+              displayName: 'Template Deployment - Prod'
+              inputs:
+                deploymentScope: Resource group
+                resourceGroupName: $(resourceGroup)
+                azureResourceManagerConnection: 'sub-workload-prod'
+                subscriptionId: '$(workloadSubId)'
+                location: '$(acrLocation)'
+                csmFile: $(Agent.BuildDirectory)/acr/templates/azuredeploy.json
+                overrideParameters: '-acrName $(acrName) -acrReplicaLocation $(acrReplicaLocation) -acrLocation $(acrLocation) -AzpAzpServicePrincipalId $(spId)'
+                deploymentOutputs: 'ArmOutputs'
+                deploymentMode: Incremental
+            - task: PowerShell@2
+              inputs:
+                targetType: filePath
+                filePath: $(Agent.BuildDirectory)/acr/scripts/ParseARMOutputs.ps1
+                arguments: -ArmOutputString '$(ArmOutputs)'
+                pwsh: true
+              displayName: "Parsing outputs from ARM deployment to pipeline variables"
+            - task: AzurePowerShell@5
+              displayName: 'Add ACR Credential to Key Vault'
+              inputs:
+                azureSubscription: 'sub-workload-prod'
+                ScriptType: filePath
+                ScriptPath: $(Agent.BuildDirectory)/acr/scripts/AddACRCredToKV.ps1
+                ScriptArguments: -acrResourceGroup '$(resourceGroup)' -acrName '$(acrName)' -kvName '$(keyvaultName)' -acrUserNameSecretName '$(acrUserNameKVSecret)' -acrPwSecretName '$(acrPasswordKvSecret)'
+                azurePowerShellVersion: LatestVersion

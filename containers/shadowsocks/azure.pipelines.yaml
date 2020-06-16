@@ -1,0 +1,267 @@
+name: $(BuildDefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    exclude:
+    - 'README.md'
+    - 'tests/*'
+    include:
+      - 'shadowsocks/*'
+pr:
+  branches:
+    include:
+      - master
+      - dev
+      - feature/*
+  paths:
+    exclude:
+    - 'README.md'
+    - 'tests/*'
+    include:
+      - 'shadowsocks/*'
+variables:
+ - group: variables - shadowsocks (common)
+ - group: secrets -acr
+ - name: DOCKER_BUILDKIT
+   value: 1
+ - name: tag
+   value: '$(Build.BuildId)'
+stages:
+- stage: build_and_test
+  displayName: 'Build and Test'
+  jobs:
+  - job: security_scan
+    displayName: Security Scan
+    pool:
+      vmImage: windows-latest
+    steps:
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-antimalware.AntiMalware@3
+      displayName: 'AntiMalware Scan'
+      inputs:
+        FileDirPath: '$(Build.SourcesDirectory)'
+        EnableServices: true
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-credscan.CredScan@2
+      displayName: 'Run Credential Scanner'
+      inputs:
+        outputFormat: csv
+        scanFolder: '$(Build.SourcesDirectory)'
+        verboseOutput: true
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-publishsecurityanalysislogs.PublishSecurityAnalysisLogs@2
+      displayName: 'Publish Security Analysis Logs'
+      condition: succeededOrFailed()
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-report.SdtReport@1
+      displayName: 'Create Security Analysis Report'
+      inputs:
+        AllTools: true
+      condition: succeededOrFailed()
+    - task: ms-codeanalysis.vss-microsoft-security-code-analysis-devops.build-task-postanalysis.PostAnalysis@1
+      displayName: 'Post Analysis'
+      inputs:
+        AllTools: true
+      condition: succeededOrFailed()
+  - job: Pester_Tests
+    displayName: Pester Tests
+    dependsOn: security_scan
+    pool:
+      vmImage: windows-latest
+    steps:
+    - task: RunARMTTKTests@1
+      inputs:
+        templatelocation: '$(System.DefaultWorkingDirectory)\shadowsocks'
+        resultLocation: '$(System.DefaultWorkingDirectory)'
+      displayName: 'Test - ARM Toolkit (arm-ttk)'
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results $(System.DefaultWorkingDirectory)\TEST-*.xml'
+      inputs:
+        testResultsFormat: NUnit
+        testResultsFiles: '**/*.xml' 
+        failTaskOnFailedTests: true
+  - job: Build_push_docker_image
+    displayName: Build and Push Docker image
+    pool:
+      vmImage: ubuntu-latest
+    dependsOn: Pester_Tests
+    steps:
+    - script: |
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install -y trivy rpm
+      displayName: Install Trivy
+    - script: docker build -f shadowsocks/Dockerfile -t $(imageName):$(tag) shadowsocks
+      displayName: 'docker build'
+    - task: Docker@1
+      displayName: Tag image
+      inputs:
+        command: tag
+        imageName: "$(imageName):$(tag)"
+        arguments: "$(acr).azurecr.io/$(imageName):$(tag)"
+    - script: |
+        trivy --debug --ignore-unfixed --exit-code 0 --severity MEDIUM $(imageName):$(tag)
+        trivy --debug --ignore-unfixed --exit-code 1 --severity HIGH,CRITICAL $(imageName):$(tag)
+      displayName: Scan Image - Trivy
+    - task: Docker@2
+      displayName: 'Push Docker Image'
+      inputs:
+        containerRegistry: '$(acr-connection)'
+        repository: '$(imageName)'
+        command: push
+        tags: '$(tag)'
+  - job: ARM_Deployment_Validation
+    displayName: ARM Deployment Validation
+    dependsOn: Build_push_docker_image
+    pool:
+      vmImage: windows-latest
+    variables:
+     - group: variables - shadowsocks (australia)
+    steps:
+    - task: AzurePowerShell@5
+      displayName: 'Get workload subscription Id'
+      inputs:
+        azureSubscription: 'sub-workload-dev'
+        ScriptType: InlineScript
+        Inline: |
+          $subId = (get-azcontext).subscription.id
+          Write-Output ("##vso[task.setvariable variable=workloadSubId]$subId")
+        azurePowerShellVersion: LatestVersion
+    - task: AzureResourceManagerTemplateDeployment@3
+      displayName: 'Template Validation - Shadowsocks ACI'
+      inputs:
+        deploymentScope: Resource Group
+        azureResourceManagerConnection: 'sub-workload-dev'
+        subscriptionId: '$(workloadSubId)'
+        resourceGroupName: '$(resourceGroup)'
+        location: '$(location)'
+        csmFile: shadowsocks/azuredeploy.json
+        csmParametersFile: shadowsocks/azuredeploy.parameters.json
+        overrideParameters: '-name $(aciName) -image "$(acr).azurecr.io/$(imageName):$(tag)" -location $(location) -imageUserName $(acrUserName) -imagePassword $(acrPassword) -imageRegistryLoginServer "$(acr).azurecr.io"'
+        deploymentMode: Validation
+  - job: Publish_Pattern
+    displayName: Publish Pattern
+    pool:
+      vmImage: windows-latest
+    dependsOn: ARM_Deployment_Validation
+    steps:
+    - task: CopyFiles@2
+      displayName: 'Copy Files to: $(Build.ArtifactStagingDirectory)'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)/shadowsocks'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/shadowsocks'
+        CleanTargetFolder: true
+        OverWrite: true
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact: shadowsocks'
+      inputs:
+        artifactName: 'shadowsocks'
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/shadowsocks'
+- stage: deploy_to_aus_east
+  displayName: 'Deploy To Australia East'
+  jobs:
+    - deployment: deploy_to_aus_east
+      displayName: 'Deploy to Australia_east'
+      pool:
+        vmImage: ubuntu-latest
+        timeoutInMinutes: 120
+      variables:
+        - group: variables - shadowsocks (australia)
+      environment: 'australia'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzurePowerShell@5
+              displayName: 'Get workload subscription Id'
+              inputs:
+                azureSubscription: 'sub-workload-dev'
+                ScriptType: InlineScript
+                Inline: |
+                  $subId = (get-azcontext).subscription.id
+                  Write-Output ("##vso[task.setvariable variable=workloadSubId]$subId")
+                azurePowerShellVersion: LatestVersion
+            - task: AzureResourceManagerTemplateDeployment@3
+              displayName: 'Template Deployment - Australia East'
+              inputs:
+                deploymentScope: Resource Group
+                azureResourceManagerConnection: 'sub-workload-dev'
+                subscriptionId: '$(workloadSubId)'
+                resourceGroupName: '$(resourceGroup)'
+                location: '$(location)'
+                csmFile: $(Agent.BuildDirectory)/shadowsocks/azuredeploy.json
+                csmParametersFile: $(Agent.BuildDirectory)/shadowsocks/azuredeploy.parameters.json
+                overrideParameters: '-name $(aciName) -image "$(acr).azurecr.io/$(imageName):$(tag)" -location $(location) -imageUserName $(acrUserName) -imagePassword $(acrPassword) -imageRegistryLoginServer "$(acr).azurecr.io"'
+                deploymentMode: Incremental
+- stage: deploy_to_southeast_asia
+  displayName: 'Deploy To Southeast Asia'
+  jobs:
+    - deployment: deploy_to_southeast_asia
+      displayName: 'Deploy To Southeast Asia'
+      pool:
+        vmImage: ubuntu-latest
+        timeoutInMinutes: 120
+      variables:
+        - group: variables - shadowsocks (singapore)
+      environment: 'singapore'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzurePowerShell@5
+              displayName: 'Get workload subscription Id'
+              inputs:
+                azureSubscription: 'sub-workload-dev'
+                ScriptType: InlineScript
+                Inline: |
+                  $subId = (get-azcontext).subscription.id
+                  Write-Output ("##vso[task.setvariable variable=workloadSubId]$subId")
+                azurePowerShellVersion: LatestVersion
+            - task: AzureResourceManagerTemplateDeployment@3
+              displayName: 'Template Deployment - Australia East'
+              inputs:
+                deploymentScope: Resource Group
+                azureResourceManagerConnection: 'sub-workload-dev'
+                subscriptionId: '$(workloadSubId)'
+                resourceGroupName: '$(resourceGroup)'
+                location: '$(location)'
+                csmFile: $(Agent.BuildDirectory)/shadowsocks/azuredeploy.json
+                csmParametersFile: $(Agent.BuildDirectory)/shadowsocks/azuredeploy.parameters.json
+                overrideParameters: '-name $(aciName) -image "$(acr).azurecr.io/$(imageName):$(tag)" -location $(location) -imageUserName $(acrUserName) -imagePassword $(acrPassword) -imageRegistryLoginServer "$(acr).azurecr.io"'
+                deploymentMode: Incremental
+- stage: deploy_to_usa
+  displayName: 'Deploy To USA'
+  jobs:
+    - deployment: deploy_to_usa
+      displayName: 'Deploy To USA'
+      pool:
+        vmImage: ubuntu-latest
+        timeoutInMinutes: 120
+      variables:
+        - group: variables - shadowsocks (usa)
+      environment: 'usa'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: AzurePowerShell@5
+              displayName: 'Get workload subscription Id'
+              inputs:
+                azureSubscription: 'sub-workload-dev'
+                ScriptType: InlineScript
+                Inline: |
+                  $subId = (get-azcontext).subscription.id
+                  Write-Output ("##vso[task.setvariable variable=workloadSubId]$subId")
+                azurePowerShellVersion: LatestVersion
+            - task: AzureResourceManagerTemplateDeployment@3
+              displayName: 'Template Deployment - Australia East'
+              inputs:
+                deploymentScope: Resource Group
+                azureResourceManagerConnection: 'sub-workload-dev'
+                subscriptionId: '$(workloadSubId)'
+                resourceGroupName: '$(resourceGroup)'
+                location: '$(location)'
+                csmFile: $(Agent.BuildDirectory)/shadowsocks/azuredeploy.json
+                csmParametersFile: $(Agent.BuildDirectory)/shadowsocks/azuredeploy.parameters.json
+                overrideParameters: '-name $(aciName) -image "$(acr).azurecr.io/$(imageName):$(tag)" -location $(location) -imageUserName $(acrUserName) -imagePassword $(acrPassword) -imageRegistryLoginServer "$(acr).azurecr.io"'
+                deploymentMode: Incremental

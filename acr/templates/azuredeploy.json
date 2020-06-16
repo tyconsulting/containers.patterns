@@ -1,0 +1,133 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+      "acrName": {
+        "type": "string",
+        "defaultValue": "[concat('acr', uniqueString(resourceGroup().id))]",
+        "minLength": 5,
+        "maxLength": 50,
+        "metadata": {
+          "description": "Globally unique name of your Azure Container Registry"
+        }
+      },
+      "acrAdminUserEnabled": {
+        "type": "bool",
+        "defaultValue": true,
+        "metadata": {
+          "description": "Enable admin user that has push / pull permission to the registry."
+        }
+      },
+      "acrSku": {
+        "type": "string",
+        "metadata": {
+          "description": "Tier of your Azure Container Registry. Geo-replication requires Premium SKU."
+        },
+        "defaultValue": "Premium",
+        "allowedValues": [
+          "Basic",
+          "Standard",
+          "Premium"
+        ]
+      },
+      "acrReplicaLocation": {
+        "type": "string",
+        "metadata": {
+          "description": "Short name for registry replica location."
+        }
+      },
+      "acrLocation": {
+        "type": "string",
+        "metadata": {
+          "description": "Short name for registry location."
+        }
+      },
+      "AzpAzpServicePrincipalId": {
+        "type": "string",
+        "metadata": {
+          "description": "Id of the Service Principal used by Azure Pipeline."
+        }
+      }
+    },
+    "variables": {
+        "keyVaultName": "[concat('kv-', parameters('acrName'))]"
+    },
+    "resources": [
+      {
+          "name": "[parameters('acrName')]",
+          "type": "Microsoft.ContainerRegistry/registries",
+          "apiVersion": "2019-05-01",
+          "location": "[parameters('acrLocation')]",
+          "comments": "Container registry for storing docker images",
+          "tags": {
+          "displayName": "Container Registry",
+          "container.registry": "[parameters('acrName')]"
+          },
+          "sku": {
+          "name": "[parameters('acrSku')]",
+          "tier": "[parameters('acrSku')]"
+          },
+          "properties": {
+          "adminUserEnabled": "[parameters('acrAdminUserEnabled')]"
+          }
+      },
+      {
+          "name": "[concat(parameters('acrName'), '/', parameters('acrReplicaLocation'))]",
+          "type": "Microsoft.ContainerRegistry/registries/replications",
+          "apiVersion": "2019-05-01",
+          "location": "[parameters('acrReplicaLocation')]",
+          "properties": {},
+          "dependsOn": [
+          "[concat('Microsoft.ContainerRegistry/registries/', parameters('acrName'))]"
+          ]
+      },
+      {
+        "type": "Microsoft.KeyVault/vaults",
+        "name": "[variables('keyVaultName')]",
+        "apiVersion": "2019-09-01",
+        "location": "[parameters('acrLocation')]",
+        "properties": {
+          "enabledForDeployment": false,
+          "enabledForDiskEncryption": false,
+          "enabledForTemplateDeployment": true,
+          "tenantId": "[subscription().tenantId]",
+          "accessPolicies": [
+          {
+            "tenantId": "[subscription().tenantId]",
+            "objectId": "[parameters('AzpAzpServicePrincipalId')]",
+            "permissions": {
+              "secrets": [
+                "get",
+                "list",
+                "set",
+                "delete",
+                "recover",
+                "backup",
+                "restore",
+                "purge"
+              ]
+            }
+          }
+        ],
+          "sku": {
+            "name": "standard",
+            "family": "A"
+          },
+          "networkAcls": {
+              "defaultAction": "Allow",
+              "bypass": "AzureServices"
+          }
+        }
+      }
+    ],
+    "outputs": {
+      "acrLoginServer": {
+        "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries',parameters('acrName')),'2019-05-01').loginServer]",
+        "type": "string"
+      },
+      "keyvaultName": {
+        "value": "[variables('keyVaultName')]",
+        "type": "string"
+      }
+    }
+}
